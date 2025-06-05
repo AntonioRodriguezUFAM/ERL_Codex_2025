@@ -9,6 +9,7 @@
 #include <tuple>
 #include "../SharedStructures/FrameData.h"
 #include "../SharedStructures/AlgorithmConfig.h"
+#include "../SharedStructures/ZeroCopyFrameData.h"
 
 /**
  * @brief Interface for an algorithm that can be started and stopped.
