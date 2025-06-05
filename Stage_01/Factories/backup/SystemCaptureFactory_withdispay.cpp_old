@@ -1,0 +1,426 @@
+
+// SystemCaptureFactory.cpp
+
+
+#include "../Includes/SystemCaptureFactory.h"
+#include <chrono>
+#include <pthread.h>
+#include <sched.h> // for CPU affinity (if needed)
+
+// To use SDL2, you need to link with -lSDL2
+#include <SDL2/SDL.h>  // or SDL3
+#include <vector>
+
+
+SystemCaptureFactory::SystemCaptureFactory()
+    : running_(false)
+    , paused_(false)
+    , errorCallback_(nullptr)
+{
+}
+
+SystemCaptureFactory::~SystemCaptureFactory() {
+    stopSystem();
+}
+
+
+void SystemCaptureFactory::initializeSystem() {
+    // Create cameras, algorithms, SoC from the modelingFactory
+    auto cam1 = modelingFactory_.createDataComponent();
+    auto alg1 = modelingFactory_.createAlgorithmComponent();
+    auto alg2 = modelingFactory_.createAlgorithmComponent();
+    auto socPtr = modelingFactory_.createSoCComponent();
+
+    // (Optional) Set each component’s error callback to a global function
+    if (errorCallback_) {
+        cam1->setErrorCallback(errorCallback_);
+        alg1->setErrorCallback(errorCallback_);
+        alg2->setErrorCallback(errorCallback_);
+        socPtr->setErrorCallback(errorCallback_);
+    }
+
+    // Attempt to open camera device
+    bool cam1Opened = cam1->openDevice("/dev/video0");
+    if (!cam1Opened) {
+        if (errorCallback_) {
+            errorCallback_("[SystemCaptureFactory] Failed to open /dev/video0");
+        }
+    }
+
+    // Optional: configure the camera before streaming
+    CameraConfig defaultConfig;
+    defaultConfig.width       = 640;
+    defaultConfig.height      = 480;
+    defaultConfig.fps         = 30;
+    defaultConfig.pixelFormat = "YUYV";
+
+    if (cam1Opened) {
+        cam1->configure(defaultConfig);
+    }
+
+    // Store them in vectors
+    cameras_.push_back(std::move(cam1));
+    algorithms_.push_back(std::move(alg1));
+    algorithms_.push_back(std::move(alg2));
+    soc_ = std::move(socPtr);
+
+    // Initialize SoC
+    soc_->initializeSoC();
+
+    // --- NEW CODE: Initialize SDL after we know the camera config (640x480) ---
+    bool sdlOk = initSDL(defaultConfig.width, defaultConfig.height);
+    if (!sdlOk) {
+        if (errorCallback_) {
+            errorCallback_("[SystemCaptureFactory] SDL init failed; won't display frames.");
+        }
+        // We can continue, but no window/renderer will be shown
+    }
+    // -------------------------------------------------------------------------
+
+    // Attempt to start streaming for each camera
+    for (auto& cam : cameras_) {
+        if (!cam->startStreaming()) {
+            if (errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] Failed to start streaming a camera.");
+            }
+        }
+    }
+
+    // Spawn capture threads only if streaming
+    for (auto& cam : cameras_) {
+        if (cam->isStreaming()) {
+            cameraThreads_.emplace_back(&SystemCaptureFactory::captureLoop, this, cam.get());
+        } else {
+            if (errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] Not spawning capture thread; streaming is off.");
+            }
+        }
+    }
+
+    // Start algorithms (if AlgorithmConcrete internally spawns its own thread)
+    for (auto& alg : algorithms_) {
+        alg->startAlgorithm();
+    }
+
+    // We are now running
+    running_ = true;
+
+    // SoC monitoring thread
+    socThread_ = std::thread(&SystemCaptureFactory::monitorLoop, this, soc_.get());
+
+    // Optional: orchestrator-based algorithm threads
+    for (auto& alg : algorithms_) {
+        algorithmThreads_.emplace_back(&SystemCaptureFactory::algorithmLoop, this, alg.get());
+    }
+
+    std::cout << "[SystemCaptureFactory] System initialized with 1 camera, 2 algs, 1 SoC.\n";
+}
+
+
+void SystemCaptureFactory::stopSystem() {
+    if (!running_) {
+        return; // already stopped
+    }
+
+    std::cout << "[SystemCaptureFactory] Stopping system...\n";
+
+    // 1) Signal threads to exit
+    running_ = false;
+
+    // 2) Join camera threads FIRST (so they stop calling dequeFrame)
+    for (auto& t : cameraThreads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    cameraThreads_.clear();
+
+    // 3) Now stop streaming after threads have stopped calling dequeFrame()
+    for (auto& cam : cameras_) {
+        cam->stopStreaming();
+    }
+
+    // 4) Stop SoC
+    if (soc_) {
+        soc_->stopSoC();
+        if (socThread_.joinable()) {
+            socThread_.join();
+        }
+    }
+
+    // 5) Stop algorithms (if they spawn internal threads)
+    for (auto& alg : algorithms_) {
+        alg->stopAlgorithm();
+    }
+
+    // 6) If we had started orchestrator-based algorithm threads, join them now
+    for (auto& t : algorithmThreads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    algorithmThreads_.clear();
+
+    // Optionally stop the shared queue
+    frameQueue_.stop();
+
+    std::cout << "[SystemCaptureFactory] System stopped.\n";
+}
+
+void SystemCaptureFactory::pauseAll() {
+    paused_ = true;
+    std::cout << "[SystemCaptureFactory] Paused.\n";
+}
+
+void SystemCaptureFactory::resumeAll() {
+    paused_ = false;
+    std::cout << "[SystemCaptureFactory] Resumed.\n";
+}
+
+void SystemCaptureFactory::setThreadAffinity(int cpuCore) {
+    // Example of setting CPU affinity for each camera thread
+    for (auto& t : cameraThreads_) {
+        if (t.joinable()) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(cpuCore, &cpuset);
+
+            pthread_t nativeHandle = t.native_handle();
+            if (pthread_setaffinity_np(nativeHandle, sizeof(cpu_set_t), &cpuset) != 0) {
+                if (errorCallback_) {
+                    errorCallback_("[SystemCaptureFactory] Failed to set CPU affinity for camera thread.");
+                }
+            }
+        }
+    }
+    std::cout << "[SystemCaptureFactory] Thread affinity set to CPU core " << cpuCore << ".\n";
+}
+
+void SystemCaptureFactory::configureCamera(size_t index, const CameraConfig& cfg) {
+    if (index < cameras_.size()) {
+        if (!cameras_[index]->configure(cfg)) {
+            if (errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] Failed to configure camera at index " + std::to_string(index));
+            }
+        }
+    }
+}
+
+void SystemCaptureFactory::configureAlgorithm(size_t index, const AlgorithmConfig& cfg) {
+    if (index < algorithms_.size()) {
+        if (!algorithms_[index]->configure(cfg)) {
+            if (errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] Failed to configure algorithm at index " + std::to_string(index));
+            }
+        }
+    }
+}
+
+void SystemCaptureFactory::configureSoC(const SoCConfig& cfg) {
+    if (soc_) {
+        if (!soc_->configure(cfg)) {
+            if (errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] Failed to configure SoC.");
+            }
+        }
+    }
+}
+
+void SystemCaptureFactory::setGlobalErrorCallback(std::function<void(const std::string&)> callback) {
+    errorCallback_ = std::move(callback);
+}
+
+//----------------------------------------
+// Thread Loops
+//----------------------------------------
+void SystemCaptureFactory::captureLoop(IData* camera) {
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        // Dequeue a frame
+        void* dataPtr = nullptr;
+        size_t sizeBytes = 0;
+        if (!camera->dequeFrame(dataPtr, sizeBytes)) {
+            // If no frame is ready or there's an error, just sleep a bit
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // Build a FrameData
+        FrameData frame;
+        frame.data = dataPtr;
+        frame.size = sizeBytes;
+        frame.timestamp = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count()
+        );
+
+        // Push to shared queue for algorithm consumption
+        frameQueue_.push(frame);
+
+        // Re-queue buffer
+        camera->queueBuffer();
+    }
+
+    std::cout << "[SystemCaptureFactory] captureLoop ended for a camera.\n";
+}
+
+void SystemCaptureFactory::monitorLoop(ISoC* soc) {
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+
+        std::string perf = soc->getPerformance();
+        if (!perf.empty()) {
+            std::cout << "[SoCConcrete Stats] " << perf << std::endl;
+        }
+        // Sleep according to your SoC monitoring interval
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    }
+    std::cout << "[SystemCaptureFactory] monitorLoop ended.\n";
+}
+
+void SystemCaptureFactory::algorithmLoop(IAlgorithm* alg) {
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        // Example: pop frames from queue & process
+        FrameData frame;
+        if (frameQueue_.pop(frame)) {
+            // Synchronously call the algorithm’s processFrame
+            if (!alg->processFrame(frame)) {
+                if (errorCallback_) {
+                    errorCallback_("[SystemCaptureFactory] algorithmLoop: frame processing failed.");
+                }
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    std::cout << "[SystemCaptureFactory] algorithmLoop ended.\n";
+}
+
+
+// SDL-related New SDL Methods, sets up SDL, creates a window and renderer, and two textures (original and processed).
+// A helper yuyvToRGB() function that does a simple software conversion from YUYV → RGB24.
+
+
+
+// 1) Initialize SDL
+bool SystemCaptureFactory::initSDL(int width, int height) {
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        if (errorCallback_) errorCallback_("[SystemCaptureFactory] SDL could not initialize: " + std::string(SDL_GetError()));
+        return false;
+    }
+
+    sdlWindow_ = SDL_CreateWindow("ERL Stage1 - Camera Display",
+                                  SDL_WINDOWPOS_UNDEFINED,
+                                  SDL_WINDOWPOS_UNDEFINED,
+                                  width, height,
+                                  SDL_WINDOW_SHOWN);
+    if (!sdlWindow_) {
+        if (errorCallback_) errorCallback_("[SystemCaptureFactory] Window could not be created: " + std::string(SDL_GetError()));
+        return false;
+    }
+
+    sdlRenderer_ = SDL_CreateRenderer(sdlWindow_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!sdlRenderer_) {
+        if (errorCallback_) errorCallback_("[SystemCaptureFactory] Renderer could not be created: " + std::string(SDL_GetError()));
+        return false;
+    }
+
+    // Create two textures for original & processed
+    texOriginal_ = SDL_CreateTexture(sdlRenderer_,
+                                     SDL_PIXELFORMAT_RGB24,
+                                     SDL_TEXTUREACCESS_STREAMING,
+                                     width, height);
+
+    texProcessed_ = SDL_CreateTexture(sdlRenderer_,
+                                      SDL_PIXELFORMAT_RGB24,
+                                      SDL_TEXTUREACCESS_STREAMING,
+                                      width, height);
+
+    if (!texOriginal_ || !texProcessed_) {
+        if (errorCallback_) errorCallback_("[SystemCaptureFactory] Failed to create SDL textures: " + std::string(SDL_GetError()));
+        return false;
+    }
+
+    displayWidth_  = width;
+    displayHeight_ = height;
+
+    return true;
+}
+
+void SystemCaptureFactory::closeSDL() {
+    if (texOriginal_) {
+        SDL_DestroyTexture(texOriginal_);
+        texOriginal_ = nullptr;
+    }
+    if (texProcessed_) {
+        SDL_DestroyTexture(texProcessed_);
+        texProcessed_ = nullptr;
+    }
+    if (sdlRenderer_) {
+        SDL_DestroyRenderer(sdlRenderer_);
+        sdlRenderer_ = nullptr;
+    }
+    if (sdlWindow_) {
+        SDL_DestroyWindow(sdlWindow_);
+        sdlWindow_ = nullptr;
+    }
+    SDL_Quit();
+}
+
+// 2) Simple software YUYV->RGB conversion
+void SystemCaptureFactory::yuyvToRGB(const uint8_t* yuyv, uint8_t* rgb, int width, int height) {
+    // For each 2-pixel group: Y0 U Y1 V
+    // This is a naive example, plenty of references for faster methods
+    int frameSize = width * height * 2; // since YUYV is 2 bytes/pixel
+    int pixelCount = width * height;
+
+    // We'll walk over the data in steps of 4 bytes
+    // (Y0, U, Y1, V) => produce 2 RGB pixels
+    for (int i = 0, j = 0; i < frameSize; i += 4, j += 6) {
+        uint8_t Y0 = yuyv[i + 0];
+        uint8_t U  = yuyv[i + 1];
+        uint8_t Y1 = yuyv[i + 2];
+        uint8_t V  = yuyv[i + 3];
+
+        auto clamp = [](int val) { return (val < 0) ? 0 : ((val > 255) ? 255 : val); };
+
+        // Convert YUV->RGB for pixel 0
+        int C = Y0 - 16;
+        int D = U  - 128;
+        int E = V  - 128;
+
+        int R = clamp(( 298 * C           + 409 * E + 128) >> 8);
+        int G = clamp(( 298 * C - 100 * D - 208 * E + 128) >> 8);
+        int B = clamp(( 298 * C + 516 * D           + 128) >> 8);
+
+        rgb[j + 0] = (uint8_t)R;
+        rgb[j + 1] = (uint8_t)G;
+        rgb[j + 2] = (uint8_t)B;
+
+        // For pixel 1
+        C = Y1 - 16;
+        R = clamp(( 298 * C           + 409 * E + 128) >> 8);
+        G = clamp(( 298 * C - 100 * D - 208 * E + 128) >> 8);
+        B = clamp(( 298 * C + 516 * D           + 128) >> 8);
+
+        rgb[j + 3] = (uint8_t)R;
+        rgb[j + 4] = (uint8_t)G;
+        rgb[j + 5] = (uint8_t)B;
+    }
+}
+
+
+
+// Compare this snippet from ERL_Stage_1_Framework_03/Stage_01/Factories/SystemModellingFactory.h:

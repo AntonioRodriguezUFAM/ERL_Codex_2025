@@ -1,0 +1,461 @@
+// SystemCaptureFactory.cpp
+
+
+#include "../Includes/SystemCaptureFactory.h"
+
+//#include "SystemCaptureFactory.h"
+#include <chrono>
+#include <pthread.h>
+#include <sched.h>
+#include <iostream>
+#include <vector>
+#include <cstring>    // for strerror
+#include <SDL2/SDL.h> // or SDL3 if using SDL3
+#include "Concretes/SdlDisplayConcrete.h"
+
+SystemCaptureFactory::SystemCaptureFactory()
+    : running_(false)
+    , paused_(false)
+    , errorCallback_(nullptr)
+{
+}
+
+SystemCaptureFactory::~SystemCaptureFactory() {
+    stopSystem();
+    running_ = false;
+    if (displayThread_.joinable()) {
+        displayThread_.join();
+    }
+}
+
+void SystemCaptureFactory::initializeSystem() {
+    try {
+    // Create cameras, algorithms, SoC from the modelingFactory
+    auto cam1   = modelingFactory_.createDataComponent();
+    auto cam2   = modelingFactory_.createDataComponent();
+    auto alg1   = modelingFactory_.createAlgorithmComponent();
+    auto alg2   = modelingFactory_.createAlgorithmComponent();
+    auto socPtr = modelingFactory_.createSoCComponent();
+    auto display = modelingFactory_.createDisplayComponent(); // Create the display interface
+
+    // (Optional) Set each component’s error callback
+    if (errorCallback_) {
+        cam1->setErrorCallback(errorCallback_);
+        cam2->setErrorCallback(errorCallback_);
+        alg1->setErrorCallback(errorCallback_);
+        alg2->setErrorCallback(errorCallback_);
+        socPtr->setErrorCallback(errorCallback_);
+        display->setErrorCallback(errorCallback_);
+    }
+
+    // Attempt to open camera device
+    bool cam1Opened = cam1->openDevice("/dev/video0");// /dev/video0
+    if (!cam1Opened && errorCallback_) {
+        errorCallback_("[SystemCaptureFactory] Failed to open /dev/video0");
+    }
+
+        // Attempt to open camera device
+    bool cam2Opened = cam2->openDevice("/dev/video1");// /dev/video0
+    if (!cam2Opened && errorCallback_) {
+        errorCallback_("[SystemCaptureFactory] Failed to open /dev/video1");
+    }
+
+    // Example camera config
+    CameraConfig defaultConfig;
+    defaultConfig.width       = 640;
+   // int width = 640;
+   // int height = 480;
+    defaultConfig.height      = 480;
+    defaultConfig.fps         = 30;
+    defaultConfig.pixelFormat = "YUYV";
+    if (cam1Opened) cam1->configure(defaultConfig);
+    if (cam2Opened) cam2->configure(defaultConfig);
+
+    // Store them
+    cameras_.push_back(std::move(cam1));
+    cameras_.push_back(std::move(cam2));
+    algorithms_.push_back(std::move(alg1));
+    algorithms_.push_back(std::move(alg2));
+    soc_     = std::move(socPtr);
+    display_ = std::move(display); // The display interface
+
+    // Initialize SoC
+    soc_->initializeSoC();
+
+    // Also initialize the display with the same resolution as the camera
+    // This ensures the SDL window matches the camera frames
+   // display_->initializeDisplay(defaultConfig.width, defaultConfig.height);
+
+    // Initialize the shared queue
+
+    // Start streaming cameras
+    for (auto& cam : cameras_) {
+        if (!cam->startStreaming()) {
+            if (errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] Failed to start streaming a camera.");
+            }
+        }
+    }
+
+    // Start algorithms
+    for (auto& alg : algorithms_) {
+                if (errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] Failed to start streaming a Algorithm.");
+            }
+             alg->startAlgorithm();
+        
+    }
+
+
+    // Initialize the display
+    std::cout<<"Before initialize Display"<<std::endl;
+    display_->initializeDisplay(defaultConfig.width, defaultConfig.height);
+    std::cout<<"initialize Display"<<std::endl;
+
+    // Spawn SoC monitor thread
+    socThread_ = std::thread(&SystemCaptureFactory::monitorLoop, this, soc_.get());
+
+
+    // Spawn capture threads
+    for (auto& cam : cameras_) {
+        if (cam->isStreaming()) {
+            cameraThreads_.emplace_back(&SystemCaptureFactory::captureLoop, this, cam.get());
+        } else if (errorCallback_) {
+            errorCallback_("[SystemCaptureFactory] Not spawning capture thread; streaming is off.");
+        }
+    }
+     
+     // Spa Algorithm threads
+    // Orchestrator-based algorithm threads (if they need separate loops)
+    for (auto& alg : algorithms_) {
+        if(errorCallback_){
+             errorCallback_("[SystemCaptureFactory] Not spawning Algorithm thread; Capture processing is off.");
+        }
+        algorithmThreads_.emplace_back(&SystemCaptureFactory::algorithmLoop, this, alg.get());
+    }
+
+
+    // Spawn display thread
+    displayThread_ = std::thread(&SystemCaptureFactory::displayLoop, this,display_.get());
+     std::cout<<"Display Threads"<<std::endl;
+
+    running_ = true;
+
+
+   
+
+    std::cout << "[SystemCaptureFactory] System initialized with 1 camera, 2 algs, 1 SoC, and SDL Display.\n";
+
+    } catch (const std::exception& e) {
+        std::cerr << "Initialization error: " << e.what() << std::endl;
+        stopSystem(); // Ensure proper cleanup
+        throw; // Re-throw the exception
+    }
+}
+
+
+void SystemCaptureFactory::stopSystem() {
+    if (!running_) return;
+    std::cout << "[SystemCaptureFactory] Stopping system...\n";
+
+    running_ = false;
+
+    // Join camera threads
+    for (auto& t : cameraThreads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    cameraThreads_.clear();
+
+    // Stop streaming
+    for (auto& cam : cameras_) {
+        cam->stopStreaming();
+    }
+
+    // SoC
+    if (soc_) {
+        soc_->stopSoC();
+        if (socThread_.joinable()) {
+            socThread_.join();
+        }
+    }
+
+    // Stop algorithms
+    for (auto& alg : algorithms_) {
+        alg->stopAlgorithm();
+    }
+    for (auto& t : algorithmThreads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    algorithmThreads_.clear();
+
+    // Join the display thread
+    if(display_){
+        display_->closeDisplay();
+        if (displayThread_.joinable()) {
+            displayThread_.join();
+        }
+    }
+
+    // Optionally stop the shared queue
+    frameQueue_.stop();
+
+    std::cout << "[SystemCaptureFactory] System stopped.\n";
+}
+
+
+void SystemCaptureFactory::pauseAll() {
+    paused_ = true;
+    std::cout << "[SystemCaptureFactory] Paused.\n";
+}
+
+void SystemCaptureFactory::resumeAll() {
+    paused_ = false;
+    std::cout << "[SystemCaptureFactory] Resumed.\n";
+}
+
+// These methods had unused parameters, so we either comment them out or implement them
+
+// Optionally set CPU affinity
+void SystemCaptureFactory::setThreadAffinity(int /*cpuCore*/) {
+    // Not implemented
+}
+
+void SystemCaptureFactory::configureCamera(size_t /*index*/, const CameraConfig& /*cfg*/) {
+    // Not implemented
+}
+
+void SystemCaptureFactory::configureAlgorithm(size_t /*index*/, const AlgorithmConfig& /*cfg*/) {
+    // Not implemented
+}
+
+void SystemCaptureFactory::configureSoC(const SoCConfig& /*cfg*/) {
+    // Not implemented
+}
+
+void SystemCaptureFactory::setGlobalErrorCallback(std::function<void(const std::string&)> callback) {
+    errorCallback_ = std::move(callback);
+}
+
+
+
+// captureLoop, monitorLoop, algorithmLoop implementations
+
+// --------------------------------------------------
+// Capture Loop: Convert Original + Render Both
+// --------------------------------------------------
+//-------------------------------
+// captureLoop
+//-------------------------------
+void SystemCaptureFactory::captureLoop(IData* camera) {
+    std::vector<uint8_t> rgbOriginal(displayWidth_ * displayHeight_ * 3, 0);
+
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        void* dataPtr = nullptr;
+        size_t sizeBytes = 0;
+        if (!camera->dequeFrame(dataPtr, sizeBytes)) {
+            std::cerr << "[captureLoop] Failed to dequeue frame." << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        if (!dataPtr) {
+            std::cerr << "[captureLoop] Null frame data received." << std::endl;
+            continue;
+        }
+
+        yuyvToRGB((uint8_t*)dataPtr, rgbOriginal.data(), displayWidth_, displayHeight_);
+        display_->updateOriginalFrame(rgbOriginal.data(), displayWidth_, displayHeight_);
+
+        FrameData frame;
+        frame.data = dataPtr;
+        frame.size = sizeBytes;
+        frame.timestamp = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count();
+        frameQueue_.push(frame);
+
+        camera->queueBuffer();
+    }
+}
+
+
+/*
+void SystemCaptureFactory::captureLoop(IData* camera) {
+    std::vector<uint8_t> rgbOriginal(displayWidth_ * displayHeight_ * 3, 0);
+
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        // Dequeue frame
+        void* dataPtr = nullptr;
+        size_t sizeBytes = 0;
+        if (!camera->dequeFrame(dataPtr, sizeBytes)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        // Convert
+        yuyvToRGB((uint8_t*)dataPtr, rgbOriginal.data(), displayWidth_, displayHeight_);
+        // Let the SdlDisplayConcrete show it
+        display_->updateOriginalFrame(rgbOriginal.data(), displayWidth_, displayHeight_);
+
+        // Push to the queue
+        FrameData frame;
+        frame.data      = dataPtr;
+
+        if (frame.data == nullptr) {
+          std::cerr << "[captureLoop] Received null frame data. Skipping frame." << std::endl;
+        continue;
+        }
+
+        frame.size      = sizeBytes;
+        frame.timestamp = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count();
+        frameQueue_.push(frame);
+
+        // Re-queue buffer
+        camera->queueBuffer();
+    }
+    std::cout << "[SystemCaptureFactory] captureLoop ended for a camera.\n";
+}
+*/
+
+
+// --------------------------------------------------
+// SoC Monitor Loop: Print Stats
+// --------------------------------------------------
+
+//-------------------------------------
+// monitorLoop
+//-------------------------------------
+void SystemCaptureFactory::monitorLoop(ISoC* soc) {
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+        std::string perf = soc->getPerformance();
+        if (!perf.empty()) {
+            std::cout << "[SoCConcrete Stats] " << perf << std::endl;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    std::cout << "[SystemCaptureFactory] monitorLoop ended.\n";
+}
+
+// --------------------------------------------------
+//Display Loop:
+// --------------------------------------------------
+
+//-------------------------------------
+// displayLoop
+//-------------------------------------
+void SystemCaptureFactory::displayLoop(IDisplay* display) {
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        if (display) {
+            display->renderAndPollEvents();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    std::cout << "[SystemCaptureFactory] displayLoop ended.\n";
+}
+// --------------------------------------------------
+// Algorithm Loop: Produce Processed Data
+// --------------------------------------------------
+
+//-------------------------------------
+// algorithmLoop
+//-------------------------------------
+
+/*
+void SystemCaptureFactory::algorithmLoop(IAlgorithm* alg) {
+    std::vector<uint8_t> localProcessed(displayWidth_ * displayHeight_ * 3, 0);
+
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        FrameData frame;
+        if (frameQueue_.pop(frame)) {
+            bool ok = alg->processFrame(frame);
+            if (!ok && errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] algorithmLoop: frame processing failed.");
+            }
+            else {
+                // e.g., fill localProcessed or real processing
+                for (size_t i = 0; i < localProcessed.size(); i += 3) {
+                    localProcessed[i+0] = 0;
+                    localProcessed[i+1] = 128;
+                    localProcessed[i+2] = 255;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(processedMutex_);
+                    processedRGB_.assign(localProcessed.begin(), localProcessed.end());
+                }
+                // Also update SdlDisplayConcrete
+                display_->updateProcessedFrame(localProcessed.data(), displayWidth_, displayHeight_);
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+
+    std::cout << "[SystemCaptureFactory] algorithmLoop ended.\n";
+}
+    */
+
+
+    void SystemCaptureFactory::algorithmLoop(IAlgorithm* alg) {
+    std::vector<uint8_t> localProcessed(displayWidth_ * displayHeight_ * 3, 0);
+
+    while (running_) {
+        if (paused_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        FrameData frame;
+        if (frameQueue_.pop(frame)) {
+            std::cout << "[algorithmLoop] Processing frame size: " << frame.size << " bytes." << std::endl;
+            bool ok = alg->processFrame(frame);
+
+            if (!ok && errorCallback_) {
+                errorCallback_("[SystemCaptureFactory] algorithmLoop: frame processing failed.");
+            }
+            else {
+                // e.g., fill localProcessed or real processing
+                for (size_t i = 0; i < localProcessed.size(); i += 3) {
+                    localProcessed[i+0] = 0;
+                    localProcessed[i+1] = 128;
+                    localProcessed[i+2] = 255;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(processedMutex_);
+                    processedRGB_.assign(localProcessed.begin(), localProcessed.end());
+                }
+                 // Also update SdlDisplayConcrete
+                display_->updateProcessedFrame(localProcessed.data(), displayWidth_, displayHeight_);
+                std::cout << "[algorithmLoop] Frame processed successfully." << std::endl;
+            }
+        } else {
+            std::cout << "[algorithmLoop] Frame queue empty, sleeping..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+}
+
+

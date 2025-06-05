@@ -1,0 +1,15 @@
+{
+  "rawData": {
+    "source": "file",
+    "filePath": "input_data.txt"
+  },
+  "systemCapture": {
+    "samplingRate": 100,
+    "duration": 60
+  },
+  "systemProfiling": {
+    "cpuUsage": true,
+    "memoryUsage": true,
+    "gpuUsage": false
+  }
+}

@@ -1,0 +1,68 @@
+//SystemModellingFactory.cpp
+// added     SDL 2 to dispay frames
+
+
+#include "../Includes/SystemModellingFactory.h"
+
+
+// Include your concrete classes
+#include "../Concretes/RawDataFormatConcrete.h"
+#include "../Concretes/SoCConcrete.h"
+#include "../Concretes/AlgorithmConcrete.h"
+#include "../Concretes/DataConcrete.h"
+#include "../Concretes/ConstraintsConcrete.h"
+#include "../Concretes/OptimizationConcrete.h"
+#include "../Concretes/LearningConcrete.h"
+#include "../Concretes/SdlDisplayConcrete.h" // Include DisplayConcrete.h
+
+std::unique_ptr<IRawDataFormat> SystemModelingFactory::createRawDataFormatComponent() {
+    return std::make_unique<RawDataFormatConcrete>();
+}
+
+std::unique_ptr<IData> SystemModelingFactory::createDataComponent() {
+    // Create a new DataConcrete (camera)
+    auto camera = std::make_unique<DataConcrete>();
+    // Optionally set default error callback or config here
+    // e.g., camera->setErrorCallback(...);
+    return camera;
+}
+
+std::unique_ptr<IAlgorithm> SystemModelingFactory::createAlgorithmComponent() {
+    // Create a new AlgorithmConcrete
+    auto alg = std::make_unique<AlgorithmConcrete>();
+    // Optionally set default error callback or config here
+    // e.g., alg->configure(...);
+    return alg;
+}
+
+std::unique_ptr<ISoC> SystemModelingFactory::createSoCComponent() {
+    // Create a new SoCConcrete
+    auto soc = std::make_unique<SoCConcrete>();
+    // Optionally set default error callback or config here
+    // e.g., SoCConfig scfg; scfg.monitorIntervalMs = 500; ...
+    //       soc->configure(scfg);
+    return soc;
+}
+
+// Add a method to create the display interface
+
+std::unique_ptr<IDisplay> SystemModelingFactory::createDisplayComponent() {
+    auto display = std::make_unique<SdlDisplayConcrete>();// Pointer to the display interface
+    return display;
+}
+
+
+std::unique_ptr<IConstraints> SystemModelingFactory::createConstraintsComponent() {
+    return std::make_unique<ConstraintsConcrete>();
+}
+
+std::unique_ptr<IOptimization> SystemModelingFactory::createOptimizationComponent() {
+    return std::make_unique<OptimizationConcrete>();
+}
+
+std::unique_ptr<ILearning> SystemModelingFactory::createLearningComponent() {
+    return std::make_unique<LearningConcrete>();
+}
+
+
+
